@@ -1,0 +1,41 @@
+invoice_id,customer,region,amount,due_date,status,days_overdue
+INV-1001,Starling Kiosks,scotland,2191.38,2026-09-03,paid,0
+INV-1002,Greenfield Grocers,north,25280.34,2026-10-16,open,3
+INV-1003,Pennine Provisions,south,3107.54,2026-11-02,paid,0
+INV-1004,Corner & Crumb,north,27423.4,2026-10-18,open,1
+INV-1005,Glenfiddy Hotels,north,25207.81,2026-08-13,open,67
+INV-1006,Tidewater Co-op,scotland,2063.36,2026-10-04,paid,0
+INV-1007,Nimbus Vending,south,10322.64,2026-10-25,open,0
+INV-1008,Glenfiddy Hotels,scotland,13174.75,2026-10-21,open,0
+INV-1009,Glenfiddy Hotels,north,23023.96,2026-09-29,open,20
+INV-1010,Harbour Deli,scotland,8422.07,2026-08-12,paid,0
+INV-1011,Tidewater Co-op,scotland,15216.02,2026-10-31,paid,0
+INV-1012,Greenfield Grocers,north,4287.7,2026-08-16,paid,0
+INV-1013,Corner & Crumb,south,17748.77,2026-10-12,paid,0
+INV-1014,Starling Kiosks,south,24878.88,2026-10-22,paid,0
+INV-1015,Greenfield Grocers,scotland,15640.15,2026-09-02,open,47
+INV-1016,Lantern Cafes,midlands,6199.48,2026-10-25,paid,0
+INV-1017,Oakmere Stores,midlands,13630.89,2026-11-01,paid,0
+INV-1018,Starling Kiosks,scotland,10863.18,2026-08-14,paid,0
+INV-1019,Oakmere Stores,midlands,30121.3,2026-10-07,open,12
+INV-1020,Greenfield Grocers,midlands,13254.56,2026-08-26,open,54
+INV-1021,Starling Kiosks,midlands,6743.95,2026-11-01,open,0
+INV-1022,Lantern Cafes,midlands,16224.61,2026-10-02,paid,0
+INV-1023,Greenfield Grocers,midlands,23923.01,2026-09-16,open,33
+INV-1024,Greenfield Grocers,north,26172.95,2026-09-10,paid,0
+INV-1025,Starling Kiosks,north,5213.23,2026-11-01,open,0
+INV-1026,Corner & Crumb,midlands,4725.58,2026-08-13,open,67
+INV-1027,Lantern Cafes,scotland,8705.09,2026-09-19,paid,0
+INV-1028,Corner & Crumb,scotland,20572.84,2026-08-24,paid,0
+INV-1029,Lantern Cafes,midlands,5437.97,2026-09-22,open,27
+INV-1030,Glenfiddy Hotels,south,28690.98,2026-10-26,paid,0
+INV-1031,Harbour Deli,scotland,30201.75,2026-08-16,open,64
+INV-1032,Nimbus Vending,north,14519.92,2026-08-25,open,55
+INV-1033,Nimbus Vending,scotland,15554.87,2026-10-01,paid,0
+INV-1034,Corner & Crumb,south,18177.82,2026-10-19,paid,0
+INV-1035,Greenfield Grocers,north,9236.48,2026-08-16,open,64
+INV-1036,Starling Kiosks,scotland,27137.32,2026-08-13,open,67
+INV-1037,Starling Kiosks,scotland,14325.05,2026-10-17,open,2
+INV-1038,Oakmere Stores,south,21573.04,2026-09-15,paid,0
+INV-1039,Harbour Deli,scotland,10081.66,2026-08-11,open,69
+INV-1040,Nimbus Vending,north,29400.74,2026-08-18,open,62
