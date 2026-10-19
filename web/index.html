@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Company Brain</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="banner" class="banner" hidden></div>
+
+  <!-- 1. Simulated Entra sign-in -->
+  <main id="login" class="center">
+    <div class="card signin">
+      <div class="ms-logo" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <p class="muted small">Moonpool Bakehouse &middot; simulated Microsoft Entra ID</p>
+      <h1>Sign in</h1>
+      <p class="muted">Pick a demo account. In this simulation the "sign in" issues a signed token with an app role,
+        like a real Entra ID tenant would.</p>
+      <ul id="users" class="users"></ul>
+      <p class="muted small">No passwords involved. This is a demo identity provider, not Microsoft.</p>
+    </div>
+  </main>
+
+  <!-- 2. Connect an OpenAI key -->
+  <main id="key" class="center" hidden>
+    <div class="card">
+      <h1>Connect your OpenAI key</h1>
+      <p class="muted">Signed in as <strong id="key-who"></strong>. The key stays in the server's memory for this
+        session only. It is never written to disk or logs, and is discarded on sign-out.</p>
+      <form id="key-form">
+        <input id="key-input" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false" required>
+        <button class="primary" type="submit">Connect</button>
+      </form>
+      <p id="key-error" class="error" hidden></p>
+      <p class="muted small">Use a key with a low spend limit. The default model is the cheapest available.</p>
+      <button id="key-signout" class="link">Sign out</button>
+    </div>
+  </main>
+
+  <!-- 3. The app -->
+  <div id="app" class="app" hidden>
+    <aside class="side">
+      <h2>Company Brain</h2>
+      <section>
+        <h3>Signed in</h3>
+        <div id="me"></div>
+        <button id="signout" class="link">Sign out</button>
+      </section>
+      <section>
+        <h3>Token claims</h3>
+        <pre id="claims" class="claims"></pre>
+      </section>
+      <section>
+        <h3>This role can use</h3>
+        <ul id="caps" class="caps"></ul>
+      </section>
+      <section>
+        <h3>Audit trail</h3>
+        <ol id="audit" class="audit"><li class="muted">Nothing yet.</li></ol>
+      </section>
+    </aside>
+
+    <section class="chat">
+      <div id="log" class="log" aria-live="polite"></div>
+      <div id="approval" class="approval" hidden>
+        <strong>Approval needed</strong>
+        <p id="approval-text"></p>
+        <button id="approve" class="primary">Approve</button>
+        <button id="reject">Reject</button>
+      </div>
+      <div id="chips" class="chips"></div>
+      <form id="chat-form" class="composer">
+        <input id="msg" placeholder="Ask about sales, costs, policies, or tell it to do something..." autocomplete="off" required>
+        <button class="primary" type="submit">Send</button>
+      </form>
+    </section>
+  </div>
+
+  <!-- Demo mode: what would happen next -->
+  <dialog id="video-dialog">
+    <h2>Live mode needs the local backend</h2>
+    <p class="muted">This hosted page is a static demo, so there is no server to hold an API key or run the agents.
+      Here is a recording of what happens from this point, with a real key. To run it yourself, clone the repo and
+      follow the README.</p>
+    <video id="demo-video" controls preload="none" playsinline>
+      <source src="demo.mp4" type="video/mp4">
+    </video>
+    <p id="video-missing" class="muted small" hidden>(demo.mp4 hasn't been added to the site yet.)</p>
+    <form method="dialog"><button class="primary">Close</button></form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
