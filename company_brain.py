@@ -4,7 +4,11 @@ Covers: multi-intent routing, specialist agents (analytics / knowledge-RAG),
 human-in-the-loop approval for actions, role-based permissions, audit trail,
 and persistent conversation memory (checkpointer).
 
-Run:  uv run python company_brain.py --role manager
+Each `Brain` is one user's session: it owns that user's OpenAI key, role,
+vector store, conversation memory and audit trail. Nothing is global, so
+sessions can't see each other's key or data.
+
+CLI:  uv run python company_brain.py --role manager
 """
 import argparse
 import csv
@@ -35,10 +39,9 @@ load_dotenv()
 # Cheapest OpenAI chat model at time of writing; override in .env if pricing changes.
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
 EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-llm = ChatOpenAI(model=MODEL)
 
 # --------------------------------------------------------------------------- #
-# Governance: RBAC + audit trail
+# Governance: RBAC
 # --------------------------------------------------------------------------- #
 ROLE_PERMISSIONS = {
     "staff": {"knowledge"},
@@ -46,14 +49,7 @@ ROLE_PERMISSIONS = {
     "exec": {"knowledge", "analytics", "action"},
 }
 RANK = {"staff": 0, "manager": 1, "exec": 2}
-AUDIT_FILE = "audit.jsonl"
-
-
-def audit(event: str, **fields) -> None:
-    """Append-only audit log (swap for CloudWatch / immutable store in prod)."""
-    with open(AUDIT_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": time.time(), "event": event, **fields}) + "\n")
-
+AUDIT_FILE = os.getenv("AUDIT_FILE", "audit.jsonl")
 
 # --------------------------------------------------------------------------- #
 # Mock enterprise systems (stand-ins for ERP / CRM / n8n webhooks)
@@ -94,67 +90,6 @@ def load_docs() -> list[Document]:
     return RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=80).split_documents(raw)
 
 
-_store: Optional[InMemoryVectorStore] = None
-
-
-def get_store() -> InMemoryVectorStore:
-    global _store
-    if _store is None:
-        _store = InMemoryVectorStore(OpenAIEmbeddings(model=EMBED_MODEL))
-        _store.add_documents(load_docs())
-    return _store
-
-
-# --------------------------------------------------------------------------- #
-# Specialist agents (built per-request so tools can enforce the caller's role)
-# --------------------------------------------------------------------------- #
-def build_analytics_agent():
-    @tool
-    def get_sales_summary(region: str = "", month: str = "") -> dict:
-        """Boxes, revenue and variance vs target. Optional filters: region (north, south, midlands, scotland), month (YYYY-MM)."""
-        rows = [r for r in read_csv("sales.csv")
-                if (not region or r["region"] == region.lower()) and (not month or r["month"] == month)]
-        rev, tgt = sum(float(r["revenue"]) for r in rows), sum(float(r["target_revenue"]) for r in rows)
-        return {"rows": len(rows), "boxes": sum(int(r["boxes"]) for r in rows), "revenue": round(rev, 2),
-                "target": round(tgt, 2), "vs_target_pct": round((rev / tgt - 1) * 100, 1) if tgt else None}
-
-    @tool
-    def get_overdue_invoices(min_days: int = 1) -> list:
-        """Open invoices at least `min_days` overdue (customer, amount, days_overdue)."""
-        return [r for r in read_csv("invoices.csv") if r["status"] == "open" and int(r["days_overdue"]) >= min_days]
-
-    @tool
-    def get_costs(category: str = "", month: str = "") -> dict:
-        """Total costs. Optional filters: category (spirulina extract, sherbet crystals, butter & dairy, packaging, labour, energy), month (YYYY-MM)."""
-        rows = [r for r in read_csv("costs.csv")
-                if (not category or r["category"] == category.lower()) and (not month or r["month"] == month)]
-        return {"rows": len(rows), "total": round(sum(float(r["amount"]) for r in rows), 2)}
-
-    return create_agent(llm, [get_sales_summary, get_overdue_invoices, get_costs],
-                        system_prompt="You are the analytics agent. Use tools; never guess figures. Be concise.")
-
-
-NO_RESULTS = "NO_ACCESSIBLE_RESULTS"
-
-
-def build_knowledge_agent(role: str):
-    @tool
-    def search_company_docs(query: str) -> str:
-        """Semantic search over internal policies, SOPs and reports."""
-        # Over-fetch, then filter by role, so restricted chunks don't crowd out allowed ones.
-        hits = get_store().similarity_search(query, k=12)
-        allowed = [d for d in hits if RANK[role] >= RANK[d.metadata["min_role"]]][:4]
-        audit("rag_retrieval", role=role, query=query, sources=[d.metadata["source"] for d in allowed])
-        return "\n".join(f"[{d.metadata['source']}] {d.page_content}" for d in allowed) or NO_RESULTS
-
-    return create_agent(
-        llm, [search_company_docs],
-        system_prompt=("You are the knowledge agent for Moonpool Bakehouse. Answer ONLY from text returned by "
-                       f"search_company_docs and cite the [source]. If the tool returns {NO_RESULTS} or nothing "
-                       "relevant, reply exactly: \"I don't have accessible documents on that.\" "
-                       "Never use general knowledge."))
-
-
 # --------------------------------------------------------------------------- #
 # Graph state + planner schema
 # --------------------------------------------------------------------------- #
@@ -180,8 +115,6 @@ class Plan(BaseModel):
 
 class State(TypedDict):
     messages: Annotated[list, add_messages]   # persistent memory via checkpointer
-    user_id: str
-    role: str
     tasks: list[dict]
     actions: list[dict]
     results: Annotated[list, collect]
@@ -195,132 +128,214 @@ Split the user's latest message into independent tasks (multi-intent).
 Keep each request close to the user's own wording; do not add topics they didn't ask about.
 Use earlier conversation to resolve references like "them" or "that customer"."""
 
-
-# --------------------------------------------------------------------------- #
-# Nodes
-# --------------------------------------------------------------------------- #
-def planner(state: State) -> dict:
-    plan = llm.with_structured_output(Plan).invoke([SystemMessage(PLANNER_PROMPT), *state["messages"][-8:]])
-    audit("plan", user=state["user_id"], role=state["role"], tasks=[t.model_dump() for t in plan.tasks])
-    return {
-        "results": "RESET",
-        "actions": [t.action.model_dump() for t in plan.tasks if t.agent == "action" and t.action],
-        "tasks": [t.model_dump() for t in plan.tasks],
-    }
-
-
-def dispatch(state: State) -> list[Send]:
-    """Fan out to the specialist nodes that have work (parallel execution)."""
-    by_agent: dict[str, list[str]] = {}
-    for t in state["tasks"]:
-        by_agent.setdefault(t["agent"], []).append(t["request"])
-    sends = []
-    for agent, reqs in by_agent.items():
-        if agent not in ROLE_PERMISSIONS[state["role"]]:
-            audit("denied", user=state["user_id"], role=state["role"], agent=agent)
-            sends.append(Send("denied", {"agent": agent}))
-        elif agent != "action":  # action node is routed separately (it needs full state)
-            sends.append(Send(agent, {"requests": reqs, "role": state["role"]}))
-    if not sends and not (state["actions"] and "action" in ROLE_PERMISSIONS[state["role"]]):
-        sends.append(Send("synthesise_only", {}))
-    return sends
-
-
-def run_agent(agent, requests: list[str]) -> str:
-    out = agent.invoke({"messages": [HumanMessage(" ; ".join(requests))]})
-    return out["messages"][-1].content
-
-
-def analytics_node(p: dict) -> dict:
-    return {"results": [{"agent": "analytics", "answer": run_agent(build_analytics_agent(), p["requests"])}]}
-
-
-def knowledge_node(p: dict) -> dict:
-    return {"results": [{"agent": "knowledge", "answer": run_agent(build_knowledge_agent(p["role"]), p["requests"])}]}
-
-
-def denied_node(p: dict) -> dict:
-    return {"results": [{"agent": p["agent"], "answer": f"Permission denied: your role cannot use the '{p['agent']}' capability."}]}
-
-
-def action_node(state: State) -> dict:
-    """Human-in-the-loop: nothing with side effects runs without explicit approval.
-
-    No LLM calls here: on resume LangGraph re-runs this node from the top, so the
-    approved payload must be deterministic and identical to what the human saw.
-    """
-    done = []
-    for a in state["actions"]:
-        approved = interrupt({"type": "approval_request", "automation": a["automation"],
-                              "target": a["target"], "description": AUTOMATIONS[a["automation"]]})
-        audit("approval", user=state["user_id"], action=a, approved=bool(approved))
-        if approved:
-            # real implementation: POST to n8n / Make webhook or ERP API with idempotency key
-            run_id = uuid.uuid4().hex[:8]
-            audit("action_executed", user=state["user_id"], action=a, run_id=run_id)
-            done.append({"agent": "action", "answer": f"Executed {a['automation']} for {a['target']} (run {run_id})."})
-        else:
-            done.append({"agent": "action", "answer": f"Rejected: {a['automation']} for {a['target']} was not run."})
-    return {"results": done}
-
-
-def synthesise(state: State) -> dict:
-    if not state["results"]:
-        return {"messages": [AIMessage("I couldn't identify a task in that request.")]}
-    findings = "\n".join(f"- ({r['agent']}) {r['answer']}" for r in state["results"])
-    last_user = [m for m in state["messages"] if isinstance(m, HumanMessage)][-1].content
-    reply = llm.invoke([
-        SystemMessage("Combine the specialist findings into one clear answer for a busy executive. "
-                      "Use ONLY the findings; do not add outside knowledge or claim sources that aren't listed. "
-                      "If a finding says documents are unavailable, say so plainly."),
-        HumanMessage(f"Question: {last_user}\n\nFindings:\n{findings}"),
-    ])
-    audit("response", user=state["user_id"])
-    return {"messages": [reply]}
+NO_RESULTS = "NO_ACCESSIBLE_RESULTS"
 
 
 # --------------------------------------------------------------------------- #
-# Graph assembly
+# One user's session
 # --------------------------------------------------------------------------- #
-def build_graph():
-    g = StateGraph(State)
-    g.add_node("planner", planner)
-    g.add_node("analytics", analytics_node)
-    g.add_node("knowledge", knowledge_node)
-    g.add_node("denied", denied_node)
-    g.add_node("synthesise", synthesise)
-    g.add_node("synthesise_only", lambda s: {})
-    g.add_node("action", action_node)
-    g.add_edge(START, "planner")
-    g.add_conditional_edges("planner", dispatch, ["analytics", "knowledge", "denied", "synthesise_only"])
-    # The action node reads state["actions"], so route it from the planner too.
-    g.add_conditional_edges(
-        "planner",
-        lambda s: ["action"] if s["actions"] and "action" in ROLE_PERMISSIONS[s["role"]] else [],
-        ["action"])
-    for n in ("analytics", "knowledge", "denied", "action", "synthesise_only"):
-        g.add_edge(n, "synthesise")
-    g.add_edge("synthesise", END)
-    return g.compile(checkpointer=InMemorySaver())
+class Brain:
+    def __init__(self, api_key: str, user_id: str, role: str):
+        if role not in ROLE_PERMISSIONS:
+            raise ValueError(f"unknown role {role!r}")
+        self.user_id, self.role = user_id, role
+        self.llm = ChatOpenAI(model=MODEL, api_key=api_key)
+        self._embeddings = OpenAIEmbeddings(model=EMBED_MODEL, api_key=api_key)
+        self._store: Optional[InMemoryVectorStore] = None
+        self.events: list[dict] = []   # this session's audit trail (also appended to AUDIT_FILE)
+        self.config = {"configurable": {"thread_id": uuid.uuid4().hex}}
+        self.graph = self._build_graph()
+
+    # -- governance ---------------------------------------------------------- #
+    def audit(self, event: str, **fields) -> None:
+        """Audit log entry. Never put secrets (API keys) in here."""
+        rec = {"ts": time.time(), "event": event, "user": self.user_id, "role": self.role, **fields}
+        self.events.append(rec)
+        with open(AUDIT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def can(self, capability: str) -> bool:
+        return capability in ROLE_PERMISSIONS[self.role]
+
+    # -- knowledge ----------------------------------------------------------- #
+    @property
+    def store(self) -> InMemoryVectorStore:
+        if self._store is None:
+            self._store = InMemoryVectorStore(self._embeddings)
+            self._store.add_documents(load_docs())
+        return self._store
+
+    def _knowledge_agent(self):
+        @tool
+        def search_company_docs(query: str) -> str:
+            """Semantic search over internal policies, SOPs and reports."""
+            # Over-fetch, then filter by role, so restricted chunks don't crowd out allowed ones.
+            hits = self.store.similarity_search(query, k=12)
+            allowed = [d for d in hits if RANK[self.role] >= RANK[d.metadata["min_role"]]][:4]
+            self.audit("rag_retrieval", query=query, sources=[d.metadata["source"] for d in allowed])
+            return "\n".join(f"[{d.metadata['source']}] {d.page_content}" for d in allowed) or NO_RESULTS
+
+        return create_agent(
+            self.llm, [search_company_docs],
+            system_prompt=("You are the knowledge agent for Moonpool Bakehouse. Answer ONLY from text returned by "
+                           f"search_company_docs and cite the [source]. If the tool returns {NO_RESULTS} or nothing "
+                           "relevant, reply exactly: \"I don't have accessible documents on that.\" "
+                           "Never use general knowledge."))
+
+    def _analytics_agent(self):
+        @tool
+        def get_sales_summary(region: str = "", month: str = "") -> dict:
+            """Boxes, revenue and variance vs target. Optional filters: region (north, south, midlands, scotland), month (YYYY-MM)."""
+            rows = [r for r in read_csv("sales.csv")
+                    if (not region or r["region"] == region.lower()) and (not month or r["month"] == month)]
+            rev, tgt = sum(float(r["revenue"]) for r in rows), sum(float(r["target_revenue"]) for r in rows)
+            return {"rows": len(rows), "boxes": sum(int(r["boxes"]) for r in rows), "revenue": round(rev, 2),
+                    "target": round(tgt, 2), "vs_target_pct": round((rev / tgt - 1) * 100, 1) if tgt else None}
+
+        @tool
+        def get_overdue_invoices(min_days: int = 1) -> list:
+            """Open invoices at least `min_days` overdue (customer, amount, days_overdue)."""
+            return [r for r in read_csv("invoices.csv") if r["status"] == "open" and int(r["days_overdue"]) >= min_days]
+
+        @tool
+        def get_costs(category: str = "", month: str = "") -> dict:
+            """Total costs. Optional filters: category (spirulina extract, sherbet crystals, butter & dairy, packaging, labour, energy), month (YYYY-MM)."""
+            rows = [r for r in read_csv("costs.csv")
+                    if (not category or r["category"] == category.lower()) and (not month or r["month"] == month)]
+            return {"rows": len(rows), "total": round(sum(float(r["amount"]) for r in rows), 2)}
+
+        return create_agent(self.llm, [get_sales_summary, get_overdue_invoices, get_costs],
+                            system_prompt="You are the analytics agent. Use tools; never guess figures. Be concise.")
+
+    # -- graph nodes --------------------------------------------------------- #
+    def _planner(self, state: State) -> dict:
+        plan = self.llm.with_structured_output(Plan).invoke(
+            [SystemMessage(PLANNER_PROMPT), *state["messages"][-8:]])
+        self.audit("plan", tasks=[t.model_dump() for t in plan.tasks])
+        return {
+            "results": "RESET",
+            "actions": [t.action.model_dump() for t in plan.tasks if t.agent == "action" and t.action],
+            "tasks": [t.model_dump() for t in plan.tasks],
+        }
+
+    def _dispatch(self, state: State) -> list[Send]:
+        """Fan out to the specialist nodes that have work (parallel execution)."""
+        by_agent: dict[str, list[str]] = {}
+        for t in state["tasks"]:
+            by_agent.setdefault(t["agent"], []).append(t["request"])
+        sends = []
+        for agent, reqs in by_agent.items():
+            if not self.can(agent):
+                self.audit("denied", agent=agent)
+                sends.append(Send("denied", {"agent": agent}))
+            elif agent != "action":  # action node is routed separately (it needs full state)
+                sends.append(Send(agent, {"requests": reqs}))
+        if not sends and not (state["actions"] and self.can("action")):
+            sends.append(Send("synthesise_only", {}))
+        return sends
+
+    @staticmethod
+    def _run_agent(agent, requests: list[str]) -> str:
+        out = agent.invoke({"messages": [HumanMessage(" ; ".join(requests))]})
+        return out["messages"][-1].content
+
+    def _analytics_node(self, p: dict) -> dict:
+        return {"results": [{"agent": "analytics", "answer": self._run_agent(self._analytics_agent(), p["requests"])}]}
+
+    def _knowledge_node(self, p: dict) -> dict:
+        return {"results": [{"agent": "knowledge", "answer": self._run_agent(self._knowledge_agent(), p["requests"])}]}
+
+    @staticmethod
+    def _denied_node(p: dict) -> dict:
+        return {"results": [{"agent": p["agent"],
+                             "answer": f"Permission denied: your role cannot use the '{p['agent']}' capability."}]}
+
+    def _action_node(self, state: State) -> dict:
+        """Human-in-the-loop: nothing with side effects runs without explicit approval.
+
+        No LLM calls here: on resume LangGraph re-runs this node from the top, so the
+        approved payload must be deterministic and identical to what the human saw.
+        """
+        done = []
+        for a in state["actions"]:
+            approved = interrupt({"type": "approval_request", "automation": a["automation"],
+                                  "target": a["target"], "description": AUTOMATIONS[a["automation"]]})
+            self.audit("approval", action=a, approved=bool(approved))
+            if approved:
+                # real implementation: POST to n8n / Make webhook or ERP API with idempotency key
+                run_id = uuid.uuid4().hex[:8]
+                self.audit("action_executed", action=a, run_id=run_id)
+                done.append({"agent": "action",
+                             "answer": f"Executed {a['automation']} for {a['target']} (run {run_id})."})
+            else:
+                done.append({"agent": "action",
+                             "answer": f"Rejected: {a['automation']} for {a['target']} was not run."})
+        return {"results": done}
+
+    def _synthesise(self, state: State) -> dict:
+        if not state["results"]:
+            return {"messages": [AIMessage("I couldn't identify a task in that request.")]}
+        findings = "\n".join(f"- ({r['agent']}) {r['answer']}" for r in state["results"])
+        last_user = [m for m in state["messages"] if isinstance(m, HumanMessage)][-1].content
+        reply = self.llm.invoke([
+            SystemMessage("Combine the specialist findings into one clear answer for a busy executive. "
+                          "Use ONLY the findings; do not add outside knowledge or claim sources that aren't listed. "
+                          "If a finding says documents are unavailable, say so plainly."),
+            HumanMessage(f"Question: {last_user}\n\nFindings:\n{findings}"),
+        ])
+        self.audit("response")
+        return {"messages": [reply]}
+
+    def _build_graph(self):
+        g = StateGraph(State)
+        g.add_node("planner", self._planner)
+        g.add_node("analytics", self._analytics_node)
+        g.add_node("knowledge", self._knowledge_node)
+        g.add_node("denied", self._denied_node)
+        g.add_node("synthesise", self._synthesise)
+        g.add_node("synthesise_only", lambda s: {})
+        g.add_node("action", self._action_node)
+        g.add_edge(START, "planner")
+        g.add_conditional_edges("planner", self._dispatch, ["analytics", "knowledge", "denied", "synthesise_only"])
+        # The action node reads state["actions"], so route it from the planner too.
+        g.add_conditional_edges(
+            "planner", lambda s: ["action"] if s["actions"] and self.can("action") else [], ["action"])
+        for n in ("analytics", "knowledge", "denied", "action", "synthesise_only"):
+            g.add_edge(n, "synthesise")
+        g.add_edge("synthesise", END)
+        return g.compile(checkpointer=InMemorySaver())
+
+    # -- public API ---------------------------------------------------------- #
+    def _outcome(self, result: dict) -> dict:
+        if "__interrupt__" in result:
+            return {"type": "approval", "request": result["__interrupt__"][0].value}
+        return {"type": "reply", "text": result["messages"][-1].content}
+
+    def ask(self, text: str) -> dict:
+        """Send a message. Returns {'type': 'reply', 'text'} or {'type': 'approval', 'request'}."""
+        self.audit("request", chars=len(text))
+        return self._outcome(self.graph.invoke({"messages": [HumanMessage(text)]}, self.config))
+
+    def resume(self, approved: bool) -> dict:
+        """Answer a pending approval request. May return another approval request."""
+        return self._outcome(self.graph.invoke(Command(resume=approved), self.config))
 
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def chat(graph, user_id: str, role: str) -> None:
-    config = {"configurable": {"thread_id": f"{user_id}-session"}}
-    print(f"Company Brain PoC | model={MODEL} | role={role}  (Ctrl-C to quit)")
+def chat(brain: Brain) -> None:
+    print(f"Company Brain PoC | model={MODEL} | role={brain.role}  (Ctrl-C to quit)")
     while True:
         text = input("\nyou> ").strip()
         if not text:
             continue
-        payload = {"messages": [HumanMessage(text)], "user_id": user_id, "role": role}
-        result = graph.invoke(payload, config)
-        while "__interrupt__" in result:
-            req = result["__interrupt__"][0].value
+        out = brain.ask(text)
+        while out["type"] == "approval":
+            req = out["request"]
             ans = input(f"\n[APPROVAL] {req['description']} -> {req['target']}. Approve? (y/n) ").lower() == "y"
-            result = graph.invoke(Command(resume=ans), config)
-        print("\nbrain>", result["messages"][-1].content)
+            out = brain.resume(ans)
+        print("\nbrain>", out["text"])
 
 
 if __name__ == "__main__":
@@ -328,4 +343,4 @@ if __name__ == "__main__":
     ap.add_argument("--role", choices=list(ROLE_PERMISSIONS), default="manager")
     ap.add_argument("--user", default="amelie")
     args = ap.parse_args()
-    chat(build_graph(), args.user, args.role)
+    chat(Brain(os.environ["OPENAI_API_KEY"], args.user, args.role))
